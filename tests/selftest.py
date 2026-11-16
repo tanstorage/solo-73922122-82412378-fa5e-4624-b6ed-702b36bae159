@@ -10,6 +10,8 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -178,6 +180,12 @@ def run():
         after = len(client.get("/api/public").json()["publications"])
         check("库写失败后记录数不变", after == before, f"before={before} after={after}")
 
+        # 9c. 保存失败不妨碍后续发布：恢复正常后应能继续发布
+        r = client.post("/api/publish", json={"districts": ["城东", "城西"], "age_groups": ["青年"]})
+        check("保存失败后后续发布成功", r.status_code == 201, r.text)
+        after = len(client.get("/api/public").json()["publications"])
+        check("后续发布已计入公开记录", after == before + 1, f"before={before} after={after}")
+
         # ---- 10. 求解器并发安全（z3 每评估独立 Context） ----
         from concurrent.futures import ThreadPoolExecutor
 
@@ -198,6 +206,68 @@ def run():
             ),
             str(outs[:2]),
         )
+
+        # ---- 11. 并行发布：慢审查不阻塞其他发布；恢复后计入新增记录，仍安全→放行 ----
+        # 慢发布「青年」(审查 3s) 进行中，快发布「老年」应立即完成；
+        # 慢发布恢复后计入「老年」重核，「青年」+「老年」仍安全 → 发布成功。
+        _orig = dbmod.DB_PATH
+        dbmod.DB_PATH = str(Path(_TMP) / "par_a.db")
+        dbmod.init_db()
+        try:
+            r = import_csv(SAMPLE)
+            check("并行A：示例导入成功", r.status_code == 201, r.text)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                t0 = time.monotonic()
+                slow = ex.submit(client.post, "/api/publish", json={
+                    "districts": ["城东", "城西"], "age_groups": ["青年"], "demo_delay": 3})
+                time.sleep(0.6)  # 让慢发布先进入求解
+                fast = ex.submit(client.post, "/api/publish", json={
+                    "districts": ["城东", "城西"], "age_groups": ["老年"]})
+                r_fast = fast.result()
+                t_fast = time.monotonic() - t0
+                r_slow = slow.result()
+                t_slow = time.monotonic() - t0
+            check("慢审查期间另一份发布立即完成（未等慢审查结束）",
+                  r_fast.status_code == 201 and t_fast < 3,
+                  f"fast={r_fast.status_code} t_fast={t_fast:.2f}s {r_fast.text}")
+            check("慢审查恢复后计入新增记录仍安全→发布成功",
+                  r_slow.status_code == 201, f"slow={r_slow.status_code} {r_slow.text}")
+            check("慢发布总耗时覆盖其审查时长", t_slow >= 3, f"t_slow={t_slow:.2f}s")
+            pubs = client.get("/api/public").json()["publications"]
+            check("两份发布均已落盘", len(pubs) == 2, str(pubs))
+        finally:
+            dbmod.DB_PATH = _orig
+
+        # ---- 12. 并行发布：慢审查恢复后合并不安全→拒绝并显示受影响格与可行范围 ----
+        # 慢发布「城东」(审查 3s) 求解时安全；期间快发布「老年」成功；
+        # 慢发布恢复后计入「老年」重核，「城东」+「老年」暴露 城东/青年 → 409。
+        dbmod.DB_PATH = str(Path(_TMP) / "par_b.db")
+        dbmod.init_db()
+        try:
+            r = import_csv(SAMPLE)
+            check("并行B：示例导入成功", r.status_code == 201, r.text)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                slow = ex.submit(client.post, "/api/publish", json={
+                    "districts": ["城东"], "age_groups": ["青年", "老年"], "demo_delay": 3})
+                time.sleep(0.6)
+                fast = ex.submit(client.post, "/api/publish", json={
+                    "districts": ["城东", "城西"], "age_groups": ["老年"]})
+                r_fast = fast.result()
+                r_slow = slow.result()
+            check("并行B：期间发布的「老年」成功", r_fast.status_code == 201, r_fast.text)
+            check("并行B：慢审查恢复后合并「城东」不安全→拒绝(409)",
+                  r_slow.status_code == 409, f"slow={r_slow.status_code} {r_slow.text}")
+            d = r_slow.json().get("detail", {})
+            aff = d.get("affected", []) if isinstance(d, dict) else []
+            check("并行B：拒绝含受影响格 城东/青年 及可行范围[0,4]",
+                  len(aff) == 1 and aff[0]["district"] == "城东"
+                  and aff[0]["age_group"] == "青年"
+                  and aff[0]["min"] == 0 and aff[0]["max"] == 4, r_slow.text)
+            pubs = client.get("/api/public").json()["publications"]
+            check("并行B：仅「老年」落盘，被拒绝的慢发布未留记录",
+                  len(pubs) == 1 and pubs[0]["age_groups"] == ["老年"], str(pubs))
+        finally:
+            dbmod.DB_PATH = _orig
 
 
 run()

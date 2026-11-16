@@ -57,8 +57,24 @@
     <div id="prevMsg" class="msg"></div>
   </section>
 
+  <section id="demoSec" class="hidden">
+    <h2>4. 并行发布演示（模拟慢审查）</h2>
+    <p class="hint">
+      用于演示「一份发布审查很慢时，其他窗口不被阻塞」。操作步骤：<br>
+      ① 勾一组范围，点「模拟慢审查发布」——审查将持续设定秒数，期间本页可继续操作；<br>
+      ② 在慢审查进行中，改勾另一组范围，点上面的「确认发布」——它应立即完成，<b>不等慢审查</b>；<br>
+      ③ 慢审查结束时会<b>计入期间新增的公开记录</b>重核：仍安全则发布成功；合并不安全则拒绝并列出受影响格与可行范围。
+    </p>
+    <div>
+      慢审查时长 <input type="number" id="slowSec" value="6" min="1" max="30" style="width:56px"> 秒
+      <button class="secondary" onclick="doSlowPublish()">模拟慢审查发布</button>
+      <span id="slowState" class="hint"></span>
+    </div>
+    <div id="slowMsg" class="msg"></div>
+  </section>
+
   <section id="pubSec" class="hidden">
-    <h2>4. 已公开记录（不可撤销）</h2>
+    <h2>5. 已公开记录（不可撤销）</h2>
     <div id="pubs"></div>
   </section>
 </main>
@@ -100,7 +116,7 @@ async function load(){
 function render(){
   const imported = state.imported;
   document.getElementById('importSec').classList.toggle('hidden', imported);
-  for(const id of ['gridSec','selSec','pubSec'])
+  for(const id of ['gridSec','selSec','demoSec','pubSec'])
     document.getElementById(id).classList.toggle('hidden', !imported);
   if(!imported) return;
 
@@ -175,6 +191,32 @@ async function doPublish(){
     el.textContent = `已发布 #${r.id}：检出总数 ${r.total}（${esc(r.created_at)}）`;
     await load();
   }catch(e){ showErr(el, e); }
+}
+// 并行演示：发起一个审查耗时 N 秒的发布。fetch 为异步，期间页面可继续操作，
+// 用户可立即改选其他范围并正常「确认发布」，验证后者不被慢审查阻塞。
+async function doSlowPublish(){
+  const el = document.getElementById('slowMsg');
+  const st = document.getElementById('slowState');
+  const sec = Math.max(1, Math.min(30, parseInt(document.getElementById('slowSec').value || '6', 10)));
+  const sel = selection();
+  if(!sel.districts.length || !sel.age_groups.length){
+    el.className = 'msg err'; el.textContent = '请先勾选分区与年龄组'; return;
+  }
+  el.className = 'msg ok';
+  el.textContent = `慢审查求解中（约 ${sec} 秒）… 期间可改选其他范围并正常预览 / 发布。`;
+  st.textContent = '⏳ 慢审查进行中';
+  const t0 = Date.now();
+  try{
+    const r = await api('/api/publish', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...sel, demo_delay: sec})});
+    el.className = 'msg ok';
+    el.textContent = `慢审查结束（用时 ${((Date.now()-t0)/1000).toFixed(1)}s）：已按最新公开记录重核，发布 #${r.id}（检出总数 ${r.total}）。`;
+    await load();
+  }catch(e){
+    showErr(el, e);  // 409 时列出受影响格与可行范围
+  }finally{
+    st.textContent = '';
+  }
 }
 load();
 </script>

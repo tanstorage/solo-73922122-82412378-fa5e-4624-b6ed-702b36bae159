@@ -16,6 +16,8 @@ import asyncio
 import csv
 import io
 import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -43,14 +45,23 @@ MIN_POPULATION = 5
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    # 安全评估经 asyncio.to_thread 走默认执行器；扩大线程池，
+    # 保证多路慢审查（求解）并行时，预览等请求仍有可用工作线程。
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=16, thread_name_prefix="solver")
+    )
     yield
 
 
 app = FastAPI(title="疾控汇总发布安全审查台", lifespan=lifespan)
 
-# 发布串行化：确认发布时在此锁内重读最新公开记录并重核，
-# 保证"各自安全但合并不安全"的两个窗口不会都被写入。
+# 发布串行化：锁只保护"核对快照未变 + 原子写入"这一小段纯 DB 操作。
+# 求解（可能很慢）一律在锁外进行，慢审查不会阻塞其他发布、预览或公开页。
 publish_lock = asyncio.Lock()
+
+# 快照过期后在锁外按最新记录重核的重试次数；
+# 超过则在锁内做最终重核，保证正确性与终止性（极低概率路径）。
+MAX_PUBLISH_RETRIES = 3
 
 
 # ---------------- CSV 导入 ----------------
@@ -122,6 +133,8 @@ def parse_survey_csv(text: str) -> list[dict]:
 class Selection(BaseModel):
     districts: list[str] = Field(default_factory=list)
     age_groups: list[str] = Field(default_factory=list)
+    # 仅用于演示/测试：注入求解耗时（秒），模拟"慢审查"。正常发布留 0。
+    demo_delay: float = Field(default=0, ge=0, le=30)
 
 
 # ---------------- 工具 ----------------
@@ -141,6 +154,28 @@ def _match(cells: list[dict], sel: Selection) -> tuple[list[dict], int]:
     if not matched:
         raise HTTPException(400, "选择为空或交集不含任何格")
     return matched, sum(c["detected"] for c in matched)
+
+
+def _pub_ids(pubs: list[dict]) -> list[int]:
+    """公开记录的 id 序列。记录只插入、不更新/删除，序列相同即期间无新增。"""
+    return [p["id"] for p in pubs]
+
+
+def _solve(cells: list[dict], pubs: list[dict], candidate: dict, delay: float = 0.0) -> dict:
+    """在工作线程中做安全评估；delay 仅用于演示/测试慢审查。"""
+    if delay > 0:
+        time.sleep(delay)
+    return evaluate(cells, pubs, candidate)
+
+
+def _reject_unsafe(result: dict) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": "按最新公开记录重核未通过：可能暴露小样本格值，已拒绝发布",
+            "affected": result["affected"],
+        },
+    )
 
 
 # ---------------- 页面 ----------------
@@ -228,24 +263,38 @@ async def publish(sel: Selection):
         "age_groups": sel.age_groups,
         "total": total,
     }
-    async with publish_lock:
-        # 确认发布：按最新公开记录重核（防止两个窗口各自安全、合并不安全却都发布）。
-        pubs = get_publications()
-        result = await asyncio.to_thread(evaluate, cells, pubs, candidate)
+
+    # 慢审查（求解）在锁外进行：不持有发布锁，
+    # 其他窗口的发布、预览与公开页在此期间照常可用。
+    pubs_snapshot = get_publications()
+    result = await asyncio.to_thread(_solve, cells, pubs_snapshot, candidate, sel.demo_delay)
+
+    for attempt in range(MAX_PUBLISH_RETRIES + 1):
         if not result["safe"]:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "按最新公开记录重核未通过：可能暴露小样本格值，已拒绝发布",
-                    "affected": result["affected"],
-                },
-            )
-        try:
-            pub = insert_publication(sel.districts, sel.age_groups, total)
-        except Exception:
-            # 单事务写入，失败即回滚，不会留下半次发布。
-            raise HTTPException(500, "保存失败，未产生任何发布记录")
-    return pub
+            # 不安全是单调的：新增公开记录只会收紧约束，不会由不安全变安全。
+            _reject_unsafe(result)
+        async with publish_lock:
+            pubs_now = get_publications()
+            if _pub_ids(pubs_now) == _pub_ids(pubs_snapshot):
+                # 快照即最新公开记录：求解结果有效，单事务原子写入。
+                try:
+                    return insert_publication(sel.districts, sel.age_groups, total)
+                except Exception:
+                    # 失败即整体回滚，不留半次发布，也不妨碍后续发布。
+                    raise HTTPException(500, "保存失败，未产生任何发布记录")
+            if attempt == MAX_PUBLISH_RETRIES:
+                # 多次重试仍遇并发写入：锁内按最新记录最终重核，保证正确与终止。
+                result = await asyncio.to_thread(evaluate, cells, pubs_now, candidate)
+                if not result["safe"]:
+                    _reject_unsafe(result)
+                try:
+                    return insert_publication(sel.districts, sel.age_groups, total)
+                except Exception:
+                    raise HTTPException(500, "保存失败，未产生任何发布记录")
+        # 锁外：慢审查恢复后发现期间有新增公开记录——计入新记录重核，
+        # 仍安全则放行，不安全才拒绝，而非仅因记录变化就拒绝。
+        pubs_snapshot = pubs_now
+        result = await asyncio.to_thread(evaluate, cells, pubs_snapshot, candidate)
 
 
 @app.get("/api/public")
