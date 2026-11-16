@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公开数据发布</title>
+<style>
+  body{font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f4f6f8;color:#222}
+  header{background:#2e6b4f;color:#fff;padding:14px 24px}
+  header h1{margin:0;font-size:20px}
+  main{max-width:900px;margin:20px auto;padding:0 16px}
+  section{background:#fff;border-radius:8px;padding:16px 20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  h2{font-size:16px;margin:0 0 12px}
+  table{border-collapse:collapse;margin-top:8px}
+  th,td{border:1px solid #dde3ea;padding:6px 12px;font-size:14px;text-align:center}
+  th{background:#eef2f6}
+  .hint{font-size:13px;color:#667}
+</style>
+</head>
+<body>
+<header><h1>公开数据发布</h1></header>
+<main>
+  <section>
+    <h2>调查人数（分区 × 年龄组）</h2>
+    <div id="grid">加载中…</div>
+  </section>
+  <section>
+    <h2>已获准公开的汇总</h2>
+    <p class="hint">本页仅提供人数与获准汇总，不提供各格检出数。</p>
+    <div id="pubs"></div>
+  </section>
+</main>
+<script>
+function esc(s){return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function load(){
+  const r = await (await fetch('/api/public')).json();
+  if(!r.imported){
+    document.getElementById('grid').innerHTML = '<p class="hint">尚未发布数据</p>';
+    document.getElementById('pubs').innerHTML = '';
+    return;
+  }
+  const ds = [...new Set(r.cells.map(c => c.district))].sort();
+  const as = [...new Set(r.cells.map(c => c.age_group))].sort();
+  const pop = {};
+  for(const c of r.cells) pop[c.district + '|' + c.age_group] = c.population;
+  let h = '<table><tr><th>分区</th>' + as.map(a => `<th>${esc(a)}</th>`).join('') + '</tr>';
+  for(const d of ds)
+    h += `<tr><td>${esc(d)}</td>` + as.map(a => `<td>${pop[d + '|' + a] ?? '—'}</td>`).join('') + '</tr>';
+  document.getElementById('grid').innerHTML = h + '</table>';
+
+  document.getElementById('pubs').innerHTML = r.publications.length
+    ? '<table><tr><th>#</th><th>分区</th><th>年龄组</th><th>检出总数</th><th>发布时间 (UTC)</th></tr>'
+      + r.publications.map(p => `<tr><td>${p.id}</td><td>${esc(p.districts.join('、'))}</td><td>${esc(p.age_groups.join('、'))}</td><td>${p.total}</td><td>${esc(p.created_at)}</td></tr>`).join('')
+      + '</table>'
+    : '<p class="hint">暂无公开汇总</p>';
+}
+load();
+</script>
+</body>
+</html>

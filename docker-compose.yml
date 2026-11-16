@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    container_name: cdc-release-guard
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_PATH=/data/app.db
+    volumes:
+      - app_data:/data   # SQLite 持久化：公开记录重启保留
+    restart: unless-stopped
+
+volumes:
+  app_data:

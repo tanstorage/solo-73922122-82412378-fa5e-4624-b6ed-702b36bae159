@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>疾控汇总发布安全审查台（内部）</title>
+<style>
+  body{font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f4f6f8;color:#222}
+  header{background:#0f4c81;color:#fff;padding:14px 24px;display:flex;align-items:baseline;gap:16px}
+  header h1{margin:0;font-size:20px}
+  header a{color:#cfe3ff;font-size:13px}
+  main{max-width:1000px;margin:20px auto;padding:0 16px}
+  section{background:#fff;border-radius:8px;padding:16px 20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  h2{font-size:16px;margin:0 0 12px}
+  table{border-collapse:collapse;margin-top:8px}
+  th,td{border:1px solid #dde3ea;padding:6px 12px;font-size:14px;text-align:center}
+  th{background:#eef2f6}
+  button{background:#0f4c81;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-size:14px;cursor:pointer;margin-right:8px}
+  button.secondary{background:#5a6b7b}
+  .checks{margin:6px 0}
+  .checks label{display:inline-block;margin:4px 12px 4px 0;font-size:14px}
+  .msg{margin-top:12px;padding:10px 12px;border-radius:6px;font-size:14px;white-space:pre-wrap;display:none}
+  .msg.ok{display:block;background:#e6f6e8;border:1px solid #9ed3a7}
+  .msg.err{display:block;background:#fdecea;border:1px solid #f2b8b0}
+  .hidden{display:none}
+  .hint{font-size:13px;color:#667}
+</style>
+</head>
+<body>
+<header>
+  <h1>疾控汇总发布安全审查台（内部）</h1>
+  <a href="/public" target="_blank">查看公开页 →</a>
+</header>
+<main>
+  <section id="importSec">
+    <h2>1. 导入调查数据</h2>
+    <p class="hint">CSV 表头：分区,年龄组,人数,检出数。至多 16 格；人数 ≥ 5；检出数为 0~人数的整数；（分区,年龄组）组合唯一。<b>导入后不可更换。</b></p>
+    <input type="file" id="file" accept=".csv">
+    <button onclick="doImport()">导入 CSV</button>
+    <button class="secondary" onclick="importSample()">导入示例数据</button>
+    <div id="importMsg" class="msg"></div>
+  </section>
+
+  <section id="gridSec" class="hidden">
+    <h2>2. 原始数据（仅内部可见，公开页不含格内检出数）</h2>
+    <div id="grid"></div>
+  </section>
+
+  <section id="selSec" class="hidden">
+    <h2>3. 选择发布范围并预览 / 发布</h2>
+    <div class="checks" id="dChecks"></div>
+    <div class="checks" id="aChecks"></div>
+    <div style="margin-top:10px">
+      <button onclick="doPreview()">预览交集检出总数</button>
+      <button onclick="doPublish()">确认发布</button>
+    </div>
+    <div id="prevMsg" class="msg"></div>
+  </section>
+
+  <section id="pubSec" class="hidden">
+    <h2>4. 已公开记录（不可撤销）</h2>
+    <div id="pubs"></div>
+  </section>
+</main>
+<script>
+let state = null;
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if(!r.ok) throw {status: r.status, body};
+  return body;
+}
+function esc(s){return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function fmtAffected(affected){
+  let t = '';
+  for(const a of (affected || [])){
+    t += `\n· ${a.district} / ${a.age_group}：可行范围 [${a.min}, ${a.max}]，`
+       + (a.zero_feasible ? '可取 0' : '不可取 0') + '，'
+       + (a.ge5_feasible ? '可取 ≥5' : '不可取 ≥5');
+  }
+  return t;
+}
+function showErr(el, e){
+  let text = '操作失败';
+  const d = e.body && e.body.detail;
+  if(typeof d === 'string') text = d;
+  else if(d){
+    text = d.message || '请求被拒绝';
+    if(d.affected && d.affected.length) text += '\n受影响格：' + fmtAffected(d.affected);
+  }
+  el.className = 'msg err';
+  el.textContent = text;
+}
+
+async function load(){
+  state = await api('/api/admin/state');
+  render();
+}
+function render(){
+  const imported = state.imported;
+  document.getElementById('importSec').classList.toggle('hidden', imported);
+  for(const id of ['gridSec','selSec','pubSec'])
+    document.getElementById(id).classList.toggle('hidden', !imported);
+  if(!imported) return;
+
+  let h = '<table><tr><th>分区</th><th>年龄组</th><th>人数</th><th>检出数</th></tr>';
+  for(const c of state.cells)
+    h += `<tr><td>${esc(c.district)}</td><td>${esc(c.age_group)}</td><td>${c.population}</td><td>${c.detected}</td></tr>`;
+  document.getElementById('grid').innerHTML = h + '</table>';
+
+  document.getElementById('dChecks').innerHTML = '<b>分区：</b>'
+    + state.districts.map(d => `<label><input type="checkbox" class="dchk" value="${esc(d)}"> ${esc(d)}</label>`).join('');
+  document.getElementById('aChecks').innerHTML = '<b>年龄组：</b>'
+    + state.age_groups.map(a => `<label><input type="checkbox" class="achk" value="${esc(a)}"> ${esc(a)}</label>`).join('');
+
+  const pubs = state.publications;
+  document.getElementById('pubs').innerHTML = pubs.length
+    ? '<table><tr><th>#</th><th>分区</th><th>年龄组</th><th>检出总数</th><th>发布时间 (UTC)</th></tr>'
+      + pubs.map(p => `<tr><td>${p.id}</td><td>${esc(p.districts.join('、'))}</td><td>${esc(p.age_groups.join('、'))}</td><td>${p.total}</td><td>${esc(p.created_at)}</td></tr>`).join('')
+      + '</table>'
+    : '<p class="hint">暂无公开记录</p>';
+}
+function selection(){
+  return {
+    districts: [...document.querySelectorAll('.dchk:checked')].map(e => e.value),
+    age_groups: [...document.querySelectorAll('.achk:checked')].map(e => e.value),
+  };
+}
+
+async function doImport(){
+  const el = document.getElementById('importMsg');
+  const f = document.getElementById('file').files[0];
+  if(!f){ el.className = 'msg err'; el.textContent = '请选择 CSV 文件'; return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  try{
+    const r = await api('/api/import', {method: 'POST', body: fd});
+    el.className = 'msg ok';
+    el.textContent = `已导入 ${r.imported} 格，此后不可更换。`;
+    await load();
+  }catch(e){ showErr(el, e); }
+}
+async function importSample(){
+  const el = document.getElementById('importMsg');
+  try{
+    const t = await (await fetch('/sample_survey.csv')).text();
+    const fd = new FormData();
+    fd.append('file', new Blob([t], {type: 'text/csv'}), 'sample_survey.csv');
+    const r = await api('/api/import', {method: 'POST', body: fd});
+    el.className = 'msg ok';
+    el.textContent = `已导入示例数据 ${r.imported} 格，此后不可更换。`;
+    await load();
+  }catch(e){ showErr(el, e); }
+}
+async function doPreview(){
+  const el = document.getElementById('prevMsg');
+  try{
+    const r = await api('/api/preview', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(selection())});
+    if(r.safe){
+      el.className = 'msg ok';
+      el.textContent = `交集检出总数：${r.total}（${r.cells_matched} 格）\n安全审查通过：所有原检出数 1~4 的格仍保留取 0 及 ≥5 的可行解。`;
+    }else{
+      el.className = 'msg err';
+      el.textContent = `交集检出总数：${r.total}（${r.cells_matched} 格）\n安全审查未通过，发布将被拒绝。受影响格：` + fmtAffected(r.affected);
+    }
+  }catch(e){ showErr(el, e); }
+}
+async function doPublish(){
+  const el = document.getElementById('prevMsg');
+  if(!confirm('确认发布将按最新公开记录重新核查，且发布记录不可撤销。继续？')) return;
+  try{
+    const r = await api('/api/publish', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(selection())});
+    el.className = 'msg ok';
+    el.textContent = `已发布 #${r.id}：检出总数 ${r.total}（${esc(r.created_at)}）`;
+    await load();
+  }catch(e){ showErr(el, e); }
+}
+load();
+</script>
+</body>
+</html>
